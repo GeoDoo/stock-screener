@@ -221,58 +221,150 @@ def get_common_tickers():
 def calculate_magic_formula_metrics(companies_df, income_df, balance_df, prices_df):
     """
     Calculate Magic Formula metrics (ROC and Earnings Yield) for all companies
+    Following Joel Greenblatt's Magic Formula criteria:
+    1. Filter for US market only
+    2. Exclude companies with market cap < $50M
+    3. Calculate proper ROC and EY using correct formulas
     """
     logging.info("Calculating Magic Formula metrics...")
+    logging.info(f"Initial companies count: {len(companies_df)}")
     
-    # Get latest prices for each company
+    # Get latest prices and dates for each company
     latest_prices = prices_df.reset_index().groupby('Ticker').last()
+    logging.info(f"Companies with price data: {len(latest_prices)}")
     
     # Calculate market cap (shares outstanding * price)
     market_cap = latest_prices['Shares Outstanding'] * latest_prices['Close']
     market_cap.name = 'Market Cap'
+    logging.info(f"Companies with market cap calculated: {len(market_cap)}")
+    
+    # Get price dates
+    price_dates = latest_prices['Date']
+    price_dates.name = 'Price From'
+    
+    # Get most recent quarter data
+    most_recent_quarters = income_df.sort_values('Report Date').groupby('SimFinId').last()
+    most_recent_quarters['Most Recent Quarter Data'] = most_recent_quarters['Report Date']
+    logging.info(f"Companies with recent quarter data: {len(most_recent_quarters)}")
+    
+    # Log date ranges
+    logging.info(f"Price data range: {prices_df['Date'].min()} to {prices_df['Date'].max()}")
+    logging.info(f"Income statement data range: {income_df['Report Date'].min()} to {income_df['Report Date'].max()}")
+    logging.info(f"Balance sheet data range: {balance_df['Report Date'].min()} to {balance_df['Report Date'].max()}")
+    
+    # 1. Filter for US market only BEFORE merging
+    companies_df = companies_df[companies_df['Market'].str.lower() == 'us']
+    logging.info(f"After US market filter (pre-merge): {len(companies_df)}")
     
     # Merge financial data
-    merged_df = pd.merge(companies_df, income_df[['SimFinId', 'Operating Income (Loss)', 'Revenue']], 
+    merged_df = pd.merge(companies_df, income_df[['SimFinId', 'Operating Income (Loss)', 'Revenue', 'Interest Expense, Net']], 
                         on='SimFinId', how='left')
+    logging.info(f"After merging with income data: {len(merged_df)}")
+    
     merged_df = pd.merge(merged_df, balance_df[['SimFinId', 'Total Current Assets', 'Total Current Liabilities', 
-                                              'Property, Plant & Equipment, Net', 'Total Assets']], 
+                                              'Property, Plant & Equipment, Net', 
+                                              'Cash, Cash Equivalents & Short Term Investments',
+                                              'Short Term Debt', 'Long Term Debt', 'Total Assets']], 
                         on='SimFinId', how='left')
+    logging.info(f"After merging with balance sheet data: {len(merged_df)}")
     
-    # Merge with market cap
+    # Merge with market cap and dates
     merged_df = pd.merge(merged_df, market_cap.reset_index(), on='Ticker', how='left')
+    logging.info(f"After merging with market cap data: {len(merged_df)}")
     
-    # Calculate metrics
+    merged_df = pd.merge(merged_df, price_dates.reset_index(), on='Ticker', how='left')
+    merged_df = pd.merge(merged_df, most_recent_quarters[['Most Recent Quarter Data']], 
+                        left_on='SimFinId', right_index=True, how='left')
+    logging.info(f"After merging all data: {len(merged_df)}")
+    
+    # Log nulls in key columns
+    key_columns = ['Operating Income (Loss)', 'Total Current Assets', 'Total Current Liabilities', 
+                  'Property, Plant & Equipment, Net', 'Market Cap', 'Most Recent Quarter Data']
+    for col in key_columns:
+        null_count = merged_df[col].isnull().sum()
+        logging.info(f"Nulls in {col}: {null_count}")
+    
+    # 2. Calculate proper metrics
     merged_df['EBIT'] = merged_df['Operating Income (Loss)']
     merged_df['Net Working Capital'] = merged_df['Total Current Assets'] - merged_df['Total Current Liabilities']
     merged_df['Net Fixed Assets'] = merged_df['Property, Plant & Equipment, Net']
     merged_df['Invested Capital'] = merged_df['Net Working Capital'] + merged_df['Net Fixed Assets']
     
-    # Calculate ROC and Earnings Yield
+    # Calculate Total Debt and Enterprise Value
+    merged_df['Total Debt'] = merged_df['Short Term Debt'] + merged_df['Long Term Debt']
+    merged_df['Enterprise Value'] = merged_df['Market Cap'] + merged_df['Total Debt'] - merged_df['Cash, Cash Equivalents & Short Term Investments']
+    
+    # Analyze Enterprise Value distribution
+    ev_stats = merged_df['Enterprise Value'].describe()
+    logging.info("\nEnterprise Value Distribution:")
+    logging.info(f"Count: {ev_stats['count']}")
+    logging.info(f"Mean: ${ev_stats['mean']/1e6:.2f}M")
+    logging.info(f"Std: ${ev_stats['std']/1e6:.2f}M")
+    logging.info(f"Min: ${ev_stats['min']/1e6:.2f}M")
+    logging.info(f"25%: ${ev_stats['25%']/1e6:.2f}M")
+    logging.info(f"50%: ${ev_stats['50%']/1e6:.2f}M")
+    logging.info(f"75%: ${ev_stats['75%']/1e6:.2f}M")
+    logging.info(f"Max: ${ev_stats['max']/1e6:.2f}M")
+    
+    # Log companies with negative Enterprise Value
+    neg_ev_df = merged_df[merged_df['Enterprise Value'] <= 0][['Company Name', 'Ticker', 'Market Cap', 'Total Debt', 'Cash, Cash Equivalents & Short Term Investments', 'Enterprise Value']]
+    neg_ev_df = neg_ev_df.head(10)  # Show first 10 examples
+    logging.info("\nExample companies with negative/zero Enterprise Value:")
+    for _, row in neg_ev_df.iterrows():
+        logging.info(f"{row['Company Name']} ({row['Ticker']}): Market Cap=${row['Market Cap']/1e6:.2f}M, Debt=${row['Total Debt']/1e6:.2f}M, Cash=${row['Cash, Cash Equivalents & Short Term Investments']/1e6:.2f}M, EV=${row['Enterprise Value']/1e6:.2f}M")
+    
+    # Log metrics before filtering
+    metrics = ['EBIT', 'Invested Capital', 'Enterprise Value', 'Market Cap']
+    for metric in metrics:
+        negative_count = len(merged_df[merged_df[metric] <= 0])
+        logging.info(f"Companies with {metric} <= 0: {negative_count}")
+    
+    # 3. Filter out invalid entries
+    filtered_df = merged_df[merged_df['Market Cap'] > 50e6]
+    logging.info(f"After market cap filter: {len(filtered_df)}")
+    
+    filtered_df = filtered_df[filtered_df['EBIT'] > 0]
+    logging.info(f"After EBIT filter: {len(filtered_df)}")
+    
+    filtered_df = filtered_df[filtered_df['Invested Capital'] > 0]
+    logging.info(f"After Invested Capital filter: {len(filtered_df)}")
+    
+    filtered_df = filtered_df[filtered_df['Enterprise Value'] > 0]
+    logging.info(f"After Enterprise Value filter: {len(filtered_df)}")
+    
+    # Filter for reasonably recent data (within last 2 years)
+    two_years_ago = pd.Timestamp.now() - pd.DateOffset(years=2)
+    filtered_df = filtered_df[pd.to_datetime(filtered_df['Most Recent Quarter Data']) >= two_years_ago]
+    logging.info(f"After date filter (2 years): {len(filtered_df)}")
+    
+    # Remove duplicates based on Ticker
+    filtered_df = filtered_df.drop_duplicates(subset=['Ticker'], keep='first')
+    logging.info(f"After removing duplicates: {len(filtered_df)}")
+    
+    merged_df = filtered_df
+    
+    # 4. Calculate Magic Formula metrics
+    # ROC = EBIT / Invested Capital
     merged_df['ROC'] = merged_df['EBIT'] / merged_df['Invested Capital']
-    merged_df['Earnings Yield'] = merged_df['EBIT'] / merged_df['Market Cap']
     
-    # Filter out invalid entries
-    merged_df = merged_df[
-        (merged_df['Market Cap'] > 50e6) &  # Market cap > $50M
-        (merged_df['EBIT'] > 0) &           # Positive EBIT
-        (merged_df['Invested Capital'] > 0)  # Positive Invested Capital
-    ]
-    
-    # Rank stocks
+    # Earnings Yield = EBIT / Enterprise Value
+    merged_df['Earnings Yield'] = merged_df['EBIT'] / merged_df['Enterprise Value']
+
+    # Calculate ranks
     merged_df['ROC Rank'] = merged_df['ROC'].rank(ascending=False)
     merged_df['EY Rank'] = merged_df['Earnings Yield'].rank(ascending=False)
     merged_df['Combined Rank'] = merged_df['ROC Rank'] + merged_df['EY Rank']
-    
-    # Sort by combined rank
-    result_df = merged_df.sort_values('Combined Rank')
-    
-    # Select and rename columns for output
-    output_columns = [
-        'Ticker', 'Company Name', 'Market Cap', 'EBIT', 
-        'ROC', 'Earnings Yield', 'ROC Rank', 'EY Rank', 'Combined Rank'
-    ]
-    
-    return result_df[output_columns].head(30)
+
+    # Sort by combined rank and take top 50
+    result_df = merged_df.nsmallest(50, 'Combined Rank')
+
+    # Format output
+    result_df = result_df[['Company Name', 'Ticker', 'Market Cap', 'Price From', 'Most Recent Quarter Data']]
+    result_df['Market Cap'] = result_df['Market Cap'] / 1_000_000  # Convert to millions
+    result_df = result_df.sort_values('Company Name')
+
+    logging.info(f'Final output contains {len(result_df)} companies')
+    return result_df
 
 def rank_stocks(df):
     """
@@ -314,7 +406,7 @@ def main():
         
         # Display results
         pd.set_option('display.float_format', lambda x: '%.2f' % x)
-        print("\nTop 30 Magic Formula Stocks:")
+        print("\nTop 50 Magic Formula Stocks:")
         print(results.to_string(index=False))
         
         # Save to CSV
